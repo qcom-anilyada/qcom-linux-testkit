@@ -1,0 +1,23 @@
+metadata:
+    format: Lava-Test Test Definition 1.0
+    name: meta_qcom
+    description: "Meta QCOM Premerge test plan - Connectivity"
+    maintainer:
+        - anilyada@qti.qualcomm.com
+    os:
+        - openembedded
+    scope:
+        - functional
+    devices:
+        - rb3gen2
+
+run:
+    steps:
+        - cd Runner
+        - $PWD/suites/Connectivity/WiFi/WiFi_OnOff/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Connectivity/WiFi/WiFi_OnOff/WiFi_OnOff.res || true
+        - $PWD/suites/Connectivity/WiFi/WiFi_Firmware_Driver/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Connectivity/WiFi/WiFi_Firmware_Driver/WiFi_Firmware_Driver.res || true
+        - $PWD/suites/Connectivity/WiFi/WiFi_Dynamic_IP/run.sh --ssid Typhon --password k&Quv$!i797oks% || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Connectivity/WiFi/WiFi_Dynamic_IP/WiFi_Dynamic_IP.res || true
+        - $PWD/utils/result_parse.sh

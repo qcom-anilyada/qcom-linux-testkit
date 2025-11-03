@@ -1,0 +1,43 @@
+metadata:
+    format: Lava-Test Test Definition 1.0
+    name: meta_qcom
+    description: "Meta QCOM Premerge test plan"
+    maintainer:
+        - anilyada@qti.qualcomm.com
+    os:
+        - openembedded
+    scope:
+        - functional
+    devices:
+        - rb3gen2
+
+run:
+    steps:
+        - cd Runner
+        - $PWD/suites/Kernel/Baseport/remoteproc/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/remoteproc/remoteproc.res || true
+        - $PWD/suites/Kernel/Baseport/hotplug/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/hotplug/hotplug.res || true
+        - $PWD/suites/Kernel/Baseport/irq/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/irq/irq.res || true
+        - $PWD/suites/Kernel/Baseport/wpss_remoteproc/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/wpss_remoteproc/wpss_remoteproc.res || true
+        - $PWD/suites/Kernel/Baseport/CPUFreq_Validation/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/CPUFreq_Validation/CPUFreq_Validation.res || true
+        - $PWD/suites/Kernel/Baseport/adsp_remoteproc/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/adsp_remoteproc/adsp_remoteproc.res || true
+        - $PWD/suites/Kernel/Baseport/cdsp_remoteproc/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/cdsp_remoteproc/cdsp_remoteproc.res || true
+        - $PWD/suites/Kernel/Baseport/USBHost/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/USBHost/USBHost.res || true
+        - $PWD/suites/Multimedia/Audio/AudioPlayback/run.sh --ssid Typhon --password k&Quv$!i797oks% || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Audio/AudioPlayback/AudioPlayback.res || true
+        - $PWD/suites/Multimedia/Audio/AudioRecord/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Audio/AudioRecord/AudioRecord.res || true
+        - $PWD/suites/Multimedia/Video/Video_V4L2_Runner/run.sh --ssid Typhon --password k&Quv$!i797oks% || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Video/Video_V4L2_Runner/Video_V4L2_Runner.res || true
+        - $PWD/suites/Multimedia/OpenCV/run.sh --bin opencv_test_sfm || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/OpenCV/OpenCV.res || true
+        - $PWD/suites/Multimedia/CDSP/fastrpc_test/run.sh --bin-dir /usr/bin/ || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/CDSP/fastrpc_test/fastrpc_test.res || true
+        - $PWD/utils/result_parse.sh
