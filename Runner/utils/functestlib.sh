@@ -602,7 +602,7 @@ extract_tar_from_url() {
     log_info "Extracting $(basename "$tarfile")..."
     if tar -xvf "$tarfile"; then
         : > "$markfile" 2>/dev/null || true
-	# Clear the minimal/offline sentinel only if it exists (SC2015-safe)
+    # Clear the minimal/offline sentinel only if it exists (SC2015-safe)
         if [ -f "$skip_sentinel" ]; then
             rm -f "$skip_sentinel" 2>/dev/null || true
         fi
@@ -706,7 +706,7 @@ weston_stop() {
         log_info "Stopping Weston..."
         pkill -x weston
         for i in $(seq 1 10); do
-			log_info "Waiting for Weston to stop with $i attempt "
+            log_info "Waiting for Weston to stop with $i attempt "
             if ! weston_is_running; then
                 log_info "Weston stopped successfully"
                 return 0
@@ -779,6 +779,63 @@ weston_start() {
     else
         log_warn "Weston spawn failed; no log file present."
     fi
+    return 1
+}
+
+overlay_start_weston_drm() {
+    EGL_JSON="/usr/share/glvnd/egl_vendor.d/EGL_adreno.json"
+ 
+    if [ -f "$EGL_JSON" ]; then
+        export __EGL_VENDOR_LIBRARY_FILENAMES="$EGL_JSON"
+        log_info "Overlay EGL: using vendor JSON: $EGL_JSON"
+    fi
+ 
+    RUNTIME_DIR="/dev/socket/weston"
+    if ! mkdir -p "$RUNTIME_DIR"; then
+        log_warn "Failed to create runtime dir $RUNTIME_DIR; falling back to /run/user/0"
+        RUNTIME_DIR="/run/user/0"
+        mkdir -p "$RUNTIME_DIR" || true
+    fi
+    chmod 700 "$RUNTIME_DIR" 2>/dev/null || true
+ 
+    XDG_RUNTIME_DIR="$RUNTIME_DIR"
+    export XDG_RUNTIME_DIR
+ 
+    # Do NOT force a specific WAYLAND_DISPLAY; let Weston decide.
+    unset WAYLAND_DISPLAY
+ 
+    log_dir=${1:-$PWD}
+    WESTON_LOG="$log_dir/weston.log"
+    log_info "Overlay Weston start: XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR (WAYLAND_DISPLAY=<auto>)"
+    log_info "Weston log: $WESTON_LOG"
+ 
+    # Start Weston in the background; we intentionally do not track the PID
+    # here to avoid killing it while clients are still using the socket.
+    weston --continue-without-input --idle-time=0 --log="$WESTON_LOG" \
+        >/dev/null 2>&1 &
+ 
+    # Best-effort check: see if ANY wayland-* socket appears, but do not kill Weston.
+    i=0
+    sock_found=""
+    while [ "$i" -lt 10 ]; do
+        for candidate in "$XDG_RUNTIME_DIR"/wayland-*; do
+            [ -S "$candidate" ] || continue
+            sock_found="$candidate"
+            break
+        done
+        [ -n "$sock_found" ] && break
+        sleep 1
+        i=$((i + 1))
+    done
+ 
+    if [ -n "$sock_found" ]; then
+        log_info "Overlay Weston created Wayland socket at $sock_found"
+        # We still let the caller discover/adopt the env via
+        # discover_wayland_socket_anywhere + adopt_wayland_env_from_socket.
+        return 0
+    fi
+ 
+    log_warn "Overlay Weston did not create a Wayland socket under $XDG_RUNTIME_DIR (see $WESTON_LOG)"
     return 1
 }
 
@@ -983,17 +1040,44 @@ find_wayland_socket_in() {
 
 # Best-effort discovery of a usable Wayland socket anywhere.
 discover_wayland_socket_anywhere() {
+    # Prefer an already-configured, valid env
+    if [ -n "$XDG_RUNTIME_DIR" ] && [ -n "$WAYLAND_DISPLAY" ] &&
+       [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then
+        printf '%s\n' "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"
+        return 0
+    fi
+
     uid="$(id -u 2>/dev/null || echo 0)"
     bases=""
-    [ -n "$XDG_RUNTIME_DIR" ] && bases="$bases $XDG_RUNTIME_DIR"
+
+    # If caller set XDG_RUNTIME_DIR, keep it as highest priority
+    if [ -n "$XDG_RUNTIME_DIR" ]; then
+        bases="$bases $XDG_RUNTIME_DIR"
+    fi
+
+    # Common locations on Linux/Android
     bases="$bases /dev/socket/weston /run/user/$uid /tmp/wayland-$uid /dev/shm"
+
     for b in $bases; do
-        ensure_private_runtime_dir "$b" >/dev/null 2>&1 || true
-        if s="$(find_wayland_socket_in "$b")"; then
+        [ -d "$b" ] || continue
+        if s="$(find_wayland_socket_in "$b" 2>/dev/null)"; then
+            [ -n "$s" ] || continue
             printf '%s\n' "$s"
             return 0
         fi
     done
+
+    # Fallback: scan all /run/user/* (handles Weston running as a different UID,
+    # e.g. weston user with UID 1000 while tests run as root).
+    for d in /run/user/*; do
+        [ -d "$d" ] || continue
+        if s="$(find_wayland_socket_in "$d" 2>/dev/null)"; then
+            [ -n "$s" ] || continue
+            printf '%s\n' "$s"
+            return 0
+        fi
+    done
+
     return 1
 }
 
@@ -1005,16 +1089,27 @@ adopt_wayland_env_from_socket() {
         log_warn "adopt_wayland_env_from_socket: invalid socket: ${s:-<empty>}"
         return 1
     fi
-    XDG_RUNTIME_DIR="$(dirname "$s")"
-    WAYLAND_DISPLAY="$(basename "$s")"
+
+    dir="$(dirname "$s")"
+    name="$(basename "$s")"
+
+    if [ -z "$dir" ] || [ -z "$name" ]; then
+        log_warn "adopt_wayland_env_from_socket: could not derive env from '$s'"
+        return 1
+    fi
+
+    XDG_RUNTIME_DIR="$dir"
+    WAYLAND_DISPLAY="$name"
     export XDG_RUNTIME_DIR WAYLAND_DISPLAY
-    # Best-effort perms fix for minimal systems
+
+    # Best-effort perms fix for minimal systems (ignore errors)
     chmod 700 "$XDG_RUNTIME_DIR" 2>/dev/null || true
+
     log_info "Adopting Wayland environment from socket: $s"
     log_info "Adopted Wayland env: XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
     log_info "Reproduce with:"
-    log_info "  export XDG_RUNTIME_DIR='$XDG_RUNTIME_DIR'"
-    log_info "  export WAYLAND_DISPLAY='$WAYLAND_DISPLAY'"
+    log_info " export XDG_RUNTIME_DIR='$XDG_RUNTIME_DIR'"
+    log_info " export WAYLAND_DISPLAY='$WAYLAND_DISPLAY'"
 }
 
 # Try to connect to Wayland. Returns 0 on OK.
@@ -1030,43 +1125,119 @@ wayland_can_connect() {
 
 # Ensure a Weston socket exists; if not, stop+start Weston and adopt helper socket.
 weston_pick_env_or_start() {
-    sock="$(discover_wayland_socket_anywhere 2>/dev/null || true)"
-    if [ -n "$sock" ]; then
-        adopt_wayland_env_from_socket "$sock"
-        log_info "Selected Wayland socket: $sock"
+    ctx="${1:-weston_pick_env_or_start}"
+    sock=""
+ 
+    # Honor WESTON_LOG_DIR for any Weston logs that helpers might write
+    log_dir="${WESTON_LOG_DIR:-/tmp}"
+    log_info "$ctx: Weston logs (if any) will be under: $log_dir"
+ 
+    # 0) If env already points to a valid socket, keep it.
+    if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -n "${WAYLAND_DISPLAY:-}" ] \
+       && [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then
+        log_info "$ctx: Using existing Wayland env: $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"
         return 0
     fi
-
-    if weston_is_running; then
-        log_info "Stopping Weston..."
-        weston_stop
-        i=0; while weston_is_running && [ "$i" -lt 5 ]; do i=$((i+1)); sleep 1; done
+ 
+    # 1) Try to discover any existing Wayland socket first.
+    if command -v discover_wayland_socket_anywhere >/dev/null 2>&1; then
+        sock="$(discover_wayland_socket_anywhere 2>/dev/null | head -n 1)"
+    elif command -v find_wayland_socket_in >/dev/null 2>&1; then
+        uid="$(id -u 2>/dev/null || echo 0)"
+        bases=""
+        [ -n "${XDG_RUNTIME_DIR:-}" ] && bases="$bases $XDG_RUNTIME_DIR"
+        bases="$bases /run/user/$uid /dev/socket/weston /tmp/wayland-$uid"
+        for b in $bases; do
+            [ -z "$b" ] && continue
+            if s="$(find_wayland_socket_in "$b" 2>/dev/null || true)"; then
+                if [ -n "$s" ]; then
+                    sock="$s"
+                    break
+                fi
+            fi
+        done
     fi
-
-    log_info "Starting Weston..."
-    weston_start
-    i=0; sock=""
-    while [ "$i" -lt 6 ]; do
-        sock="$(find_wayland_socket_in /dev/socket/weston 2>/dev/null || true)"
-        [ -n "$sock" ] && break
-        sleep 1; i=$((i+1))
-    done
-    if [ -z "$sock" ]; then
-        log_fail "Could not find Wayland socket after starting Weston."
+ 
+    if [ -n "$sock" ]; then
+        if adopt_wayland_env_from_socket "$sock"; then
+            log_info "$ctx: Selected existing Wayland socket: $sock"
+            return 0
+        fi
+        log_warn "$ctx: Failed to adopt env from existing socket: $sock"
         return 1
     fi
-    adopt_wayland_env_from_socket "$sock"
-    log_info "Weston started; socket: $sock"
+ 
+    # 2) No socket found → restart Weston and wait for a new one.
+    if weston_is_running; then
+        log_info "$ctx: Weston is running but no socket found; stopping..."
+        weston_stop
+        i=0
+        while weston_is_running && [ "$i" -lt 5 ]; do
+            i=$((i + 1))
+            sleep 1
+        done
+    fi
+ 
+    uid="$(id -u 2>/dev/null || echo 0)"
+ 
+    # Ensure XDG_RUNTIME_DIR before starting Weston (manual mkdir, no external helpers).
+    if [ -z "${XDG_RUNTIME_DIR:-}" ]; then
+        if mkdir -p "/run/user/$uid" 2>/dev/null; then
+            chmod 700 "/run/user/$uid" 2>/dev/null || true
+            XDG_RUNTIME_DIR="/run/user/$uid"
+        elif mkdir -p "/dev/socket/weston" 2>/dev/null; then
+            chmod 700 "/dev/socket/weston" 2>/dev/null || true
+            XDG_RUNTIME_DIR="/dev/socket/weston"
+        fi
+        export XDG_RUNTIME_DIR
+        log_info "$ctx: XDG_RUNTIME_DIR set to '$XDG_RUNTIME_DIR' before starting Weston"
+    else
+        mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null || true
+        chmod 700 "$XDG_RUNTIME_DIR" 2>/dev/null || true
+        log_info "$ctx: Using existing XDG_RUNTIME_DIR='$XDG_RUNTIME_DIR' before starting Weston"
+    fi
+ 
+    # Never pre-set WAYLAND_DISPLAY; let Weston choose.
+    unset WAYLAND_DISPLAY
+ 
+    log_info "$ctx: Starting Weston..."
+    weston_start
+ 
+    # 3) Wait up to ~10 seconds for any Wayland socket to appear.
+    i=0
+    sock=""
+    while [ "$i" -lt 10 ]; do
+        if command -v discover_wayland_socket_anywhere >/dev/null 2>&1; then
+            sock="$(discover_wayland_socket_anywhere 2>/dev/null | head -n 1)"
+        elif [ -n "${XDG_RUNTIME_DIR:-}" ] && command -v find_wayland_socket_in >/devnull 2>&1; then
+            sock="$(find_wayland_socket_in "$XDG_RUNTIME_DIR" 2>/dev/null || true)"
+        fi
+        if [ -n "$sock" ]; then
+            break
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+ 
+    if [ -z "$sock" ]; then
+        log_fail "$ctx: Could not find Wayland socket after starting Weston."
+        return 1
+    fi
+ 
+    if ! adopt_wayland_env_from_socket "$sock"; then
+        log_fail "$ctx: Failed to adopt env from socket: $sock"
+        return 1
+    fi
+ 
+    log_info "$ctx: Weston started; socket: $sock"
     return 0
 }
 
 # Find candidate Wayland sockets in common locations.
 # Prints absolute socket paths, one per line, most-preferred first.
 find_wayland_sockets() {
-    # Enumerate plausible Wayland sockets (one per line)
     uid="$(id -u 2>/dev/null || echo 0)"
  
-    # Current env first (if valid)
     if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -n "${WAYLAND_DISPLAY:-}" ] &&
        [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then
         echo "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"
@@ -1080,20 +1251,19 @@ find_wayland_sockets() {
         [ -S "$f" ] && echo "$f"
     done 2>/dev/null
  
-    # Any user under /run/user (root can traverse) — covers weston running as uid 1000
+    # Any other user under /run/user (covers weston as uid 100, 1000, etc.)
     for d in /run/user/*; do
         [ -d "$d" ] || continue
+        [ "$d" = "/run/user/$uid" ] && continue  # skip current uid, already handled above
         for f in "$d"/wayland-*; do
             [ -S "$f" ] && echo "$f"
         done
     done 2>/dev/null
  
-    # weston-launch sockets
     for f in /dev/socket/weston/wayland-*; do
         [ -S "$f" ] && echo "$f"
     done 2>/dev/null
  
-    # Last resort
     for f in /tmp/wayland-*; do
         [ -S "$f" ] && echo "$f"
     done 2>/dev/null
@@ -1133,36 +1303,57 @@ ensure_wayland_runtime_dir_perms() {
 # Prefers `wayland-info` with a short timeout; otherwise validates socket presence.
 # Also enforces/fixes XDG_RUNTIME_DIR permissions so clients won’t reject it.
 wayland_connection_ok() {
+    # Sanity-check the socket path first.
+    if [ -z "$XDG_RUNTIME_DIR" ] || [ -z "$WAYLAND_DISPLAY" ]; then
+        log_warn "wayland_connection_ok: XDG_RUNTIME_DIR or WAYLAND_DISPLAY not set"
+    elif [ ! -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then
+        log_warn "wayland_connection_ok: no Wayland socket at $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"
+        return 1
+    else
+        log_info "wayland_connection_ok: using socket $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"
+    fi
+
     if command -v wayland-info >/dev/null 2>&1; then
         log_info "Probing Wayland with: wayland-info"
         wayland-info >/dev/null 2>&1 && return 0
         return 1
     fi
+
     if command -v weston-info >/dev/null 2>&1; then
         log_info "Probing Wayland with: weston-info"
         weston-info >/dev/null 2>&1 && return 0
         return 1
     fi
+
     if command -v weston-simple-egl >/dev/null 2>&1; then
         log_info "Probing Wayland by briefly starting weston-simple-egl"
-        ( weston-simple-egl >/dev/null 2>&1 & echo $! >"/tmp/.wsegl.$$" )
-        pid="$(cat "/tmp/.wsegl.$$" 2>/dev/null || echo)"
+        (
+            weston-simple-egl >/dev/null 2>&1 &
+            echo "$!" >"/tmp/.wsegl.$$"
+        )
+        pid="$(cat "/tmp/.wsegl.$$" 2>/dev/null || echo '')"
         rm -f "/tmp/.wsegl.$$" 2>/dev/null || true
+
         i=0
-        while [ $i -lt 2 ]; do
+        while [ "$i" -lt 2 ]; do
             sleep 1
-            i=$((i+1))
+            i=$((i + 1))
         done
+
         if [ -n "$pid" ]; then
             kill "$pid" 2>/dev/null || true
         fi
         # If it started at all, consider the connection OK (best effort).
         return 0
     fi
-    if [ -n "$XDG_RUNTIME_DIR" ] && [ -n "$WAYLAND_DISPLAY" ] && [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then
+
+    # Last resort: trust socket existence alone.
+    if [ -n "$XDG_RUNTIME_DIR" ] && [ -n "$WAYLAND_DISPLAY" ] &&
+       [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then
         log_info "No probe tools present; accepting socket existence as OK."
         return 0
     fi
+
     return 1
 }
 # Very verbose snapshot for debugging (processes, sockets, env, perms).
@@ -1615,377 +1806,6 @@ EOF
     return 0
 }
 
-# Remove paired BT device by MAC
-bt_cleanup_paired_device() {
-    mac="$1"
-    log_info "Removing paired device: $mac"
- 
-    # Non-interactive remove to avoid “AlreadyExists”
-    bluetoothctl remove "$mac" >/dev/null 2>&1 || true
- 
-    # Full Expect cleanup (captures transcript in a logfile)
-    cleanup_log="bt_cleanup_${mac}_$(date +%Y%m%d_%H%M%S).log"
-    if expect <<EOF >"$cleanup_log" 2>&1
-log_user 1
-spawn bluetoothctl
-set timeout 10
- 
-# Match the prompt once, then send all commands in sequence
-expect -re "#|\\[.*\\]#" {
-    send "power on\r"
-    send "agent off\r"
-    send "agent NoInputNoOutput\r"
-    send "default-agent\r"
-    send "remove $mac\r"
-    send "quit\r"
-}
- 
-expect eof
-EOF
-    then
-        log_info "Device $mac removed successfully (see $cleanup_log)"
-    else
-        log_warn "Failed to remove device $mac (see $cleanup_log)"
-    fi
-}
-
-# Retry a shell command N times with sleep
-retry_command_bt() {
-    cmd="$1"
-    msg="$2"
-    max="${3:-3}"
-    count=1
-    while [ "$count" -le "$max" ]; do
-        if eval "$cmd"; then
-            return 0
-        fi
-        log_warn "Retry $count/$max failed: $msg"
-        count=$((count + 1))
-        sleep 2
-    done
-    return 1
-}
-
-# Check if a device (MAC or Name) is in the whitelist
-bt_in_whitelist() {
-    device_name="$1"
-    device_mac="$2"
-
-    whitelist_value="${WHITELIST:-}"
-    log_info "Checking if MAC='$device_mac' or NAME='$device_name' is in whitelist: '$whitelist_value'"
-
-    echo "$whitelist_value" | tr -s ' ' '\n' | while IFS= read -r allowed; do
-        if [ "$allowed" = "$device_mac" ] || [ "$allowed" = "$device_name" ]; then
-            log_info "MAC or NAME matched and allowed: $allowed"
-            return 0
-        fi
-    done
-
-    log_info "MAC matched but neither MAC nor NAME in whitelist"
-    return 1
-}
-# bt_parse_whitelist <whitelist_file>
-# Reads a whitelist file where each line has:
-bt_parse_whitelist() {
-    WHITELIST_ENTRIES=""
-    if [ -n "$1" ] && [ -f "$1" ]; then
-        while IFS= read -r line || [ -n "$line" ]; do
-            case "$line" in
-                ""|\#*) continue ;;  # Skip blank lines and comments
-                *) WHITELIST_ENTRIES="${WHITELIST_ENTRIES}${line}
-" ;;
-            esac
-        done < "$1"
-    fi
-}
-
-# bt_in_whitelist <mac> <name>
-# Checks if a given device (MAC and optional name) exists
-# Returns:
-#     0 (success) if found
-#     1 (failure) if not found
-bt_in_whitelist() {
-    mac="$1"
-    name="$2"
-
-    echo "$WHITELIST_ENTRIES" | while IFS= read -r entry || [ -n "$entry" ]; do
-        entry_mac=$(echo "$entry" | awk '{print $1}')
-        entry_name=$(echo "$entry" | cut -d' ' -f2-)
-        if [ "$mac" = "$entry_mac" ] && { [ -z "$entry_name" ] || [ "$name" = "$entry_name" ]; }; then
-            exit 0
-        fi
-    done
-
-    return 1
-}
-
-# bt_scan_devices
-# Attempts to detect nearby Bluetooth devices using:
-#   1. hcitool scan
-#   2. fallback: bluetoothctl scan (via expect)
-# Returns:
-#   0 - if devices found
-#   1 - if no devices found or error
-bt_scan_devices() {
-    timestamp=$(date '+%Y%m%d_%H%M%S')
-    scan_log="scan_${timestamp}.log"
-    found_log="found_devices_${timestamp}.log"
- 
-    : > "$scan_log"
-    : > "$found_log"
- 
-    log_info "Detecting Bluetooth adapter..."
-    hcidev=$(hciconfig | awk '/^hci/ { print $1 }' | head -n1)
-    if [ -z "$hcidev" ]; then
-        log_error "No Bluetooth adapter found"
-        return 1
-    fi
- 
-    log_info "Using Bluetooth adapter: $hcidev"
-    hciconfig "$hcidev" up
-    sleep 1
- 
-    log_info "Running Bluetooth scan via hcitool (synchronous)..."
-    script -q -c "hcitool -i $hcidev scan" "$scan_log"
-    grep -E '^(\s)*([0-9A-F]{2}:){5}[0-9A-F]{2}' "$scan_log" | awk '{print $1, $2}' > "$found_log"
- 
-    if [ -s "$found_log" ]; then
-        log_info "hcitool scan found devices, skipping bluetoothctl fallback."
-        return 0
-    fi
- 
-    log_warn "hcitool scan returned nothing. Falling back to bluetoothctl scan..."
- 
-    expect <<EOF >> "$scan_log"
-log_user 0
-spawn bluetoothctl
-expect -re "#|\\\[.*\\\]#" { send "power on\r" }
-expect -re "#|\\\[.*\\\]#" { send "agent NoInputNoOutput\r" }
-expect -re "#|\\\[.*\\\]#" { send "default-agent\r" }
-expect -re "#|\\\[.*\\\]#" { send "scan on\r" }
-sleep 10
-send "scan off\r"
-expect -re "#|\\\[.*\\\]#" { send "quit\r" }
-EOF
- 
-    grep -E "^\s*\[NEW\] Device" "$scan_log" | awk '{print $4, substr($0, index($0, $5))}' > "$found_log"
- 
-    if [ ! -s "$found_log" ]; then
-        log_warn "Scan log is empty. Possible issue with bluetoothctl or adapter."
-        return 1
-    fi
- 
-    return 0
-}
-
-# Pair with Bluetooth device using MAC (with retries and timestamped logs)
-bt_pair_with_mac() {
-    bt_mac="$1"
-    # Replace colons, strip any whitespace so no trailing spaces in filenames
-    safe_mac=$(echo "$bt_mac" | tr ':' '_' | tr -d '[:space:]')
-    max_retries=3
-    retry=1
- 
-    while [ "$retry" -le "$max_retries" ]; do
-        log_info "Interactive pairing attempt $retry for $bt_mac"
-        log_file="$PWD/bt_headless_pair_${safe_mac}_$(date +%s).log"
- 
-        expect -c "
-log_user 1
-set timeout 30
-set bt_mac \"$bt_mac\"
- 
-spawn bluetoothctl
- 
-expect -re {#|\\\[.*\\\]#} { send \"power on\r\" }
-expect -re {#|\\\[.*\\\]#} { send \"agent NoInputNoOutput\r\" }
-expect -re {#|\\\[.*\\\]#} { send \"default-agent\r\" }
-expect -re {#|\\\[.*\\\]#} { send \"scan on\r\" }
-sleep 10
-send \"scan off\r\"
-sleep 1
-send \"pair \$bt_mac\r\"
- 
-expect {
-    -re {Confirm passkey.*yes/no} {
-        send \"yes\r\"
-        exp_continue
-    }
-    -re {Authorize service.*yes/no} {
-        send \"yes\r\"
-        exp_continue
-    }
-    timeout {
-        send \"quit\r\"
-        exit 0
-    }
-    eof {
-        exit 0
-    }
-}
-" > "$log_file" 2>&1
- 
-        # Now analyze the log
-        if grep -q "Pairing successful" "$log_file"; then
-            log_pass "Pairing successful with $bt_mac"
-            return 0
-        elif grep -q "Failed to pair: org.bluez.Error" "$log_file"; then
-            log_warn "Pairing failed with $bt_mac (BlueZ error)"
-        elif grep -q "AuthenticationCanceled" "$log_file"; then
-            log_warn "Pairing canceled with $bt_mac"
-        else
-            log_warn "Pairing failed with unknown reason (check $log_file)"
-        fi
- 
-        bt_cleanup_paired_device "$bt_mac"
-        retry=$((retry + 1))
-        sleep 2
-    done
- 
-    log_fail "Pairing failed after $max_retries attempts for $bt_mac"
-    return 1
-}
-
-# Utility to reliably scan and pair Bluetooth devices through a unified workflow of repeated attempts.
-retry_scan_and_pair() {
-    retry=1
-    max_retries=2
- 
-    while [ "$retry" -le "$max_retries" ]; do
-        log_info "Bluetooth scan attempt $retry..."
-        bt_scan_devices
- 
-        if [ -n "$BT_MAC" ]; then
-            log_info "Matching against: BT_NAME='$BT_NAME', BT_MAC='$BT_MAC', WHITELIST='$WHITELIST'"
-            if ! bt_in_whitelist "$BT_MAC" "$BT_NAME"; then
-                log_warn "Expected device not found or not in whitelist"
-                retry=$((retry + 1))
-                continue
-            fi
-            bt_cleanup_paired_device "$BT_MAC"
-            if bt_pair_with_mac "$BT_MAC"; then
-                return 0
-            fi
- 
-        elif [ -n "$BT_NAME" ]; then
-            matched_mac=$(awk -v name="$BT_NAME" 'tolower($0) ~ tolower(name) { print $1; exit }' "$SCAN_RESULT")
-            if [ -n "$matched_mac" ]; then
-                log_info "Found matching device by name ($BT_NAME): $matched_mac"
-                bt_cleanup_paired_device "$matched_mac"
-                if bt_pair_with_mac "$matched_mac"; then
-                    BT_MAC="$matched_mac"
-                    return 0
-                fi
-            else
-                log_warn "Device with name $BT_NAME not found in scan results"
-            fi
- 
-        else
-            log_warn "No MAC or device name provided, and whitelist is empty"
-        fi
- 
-        retry=$((retry + 1))
-    done
- 
-    log_fail "Retry scan and pair failed after $max_retries attempts"
-    return 1
-}
-
-# Post-pairing connection test with bluetoothctl and l2ping fallback
-bt_post_pair_connect() {
-    target_mac="$1"
-    sanitized_mac=$(echo "$target_mac" | tr ':' '_')
-    timestamp=$(date '+%Y%m%d_%H%M%S')
-    base_logfile="bt_connect_${sanitized_mac}_${timestamp}"
-    max_attempts=3
-    attempt=1
- 
-    if bluetoothctl info "$target_mac" | grep -q "Connected: yes"; then
-        log_info "Device $target_mac is already connected, skipping explicit connect"
-        log_pass "Post-pair connection successful"
-        return 0
-    fi
- 
-    while [ "$attempt" -le "$max_attempts" ]; do
-        log_info "Attempting to connect post-pair (try $attempt): $target_mac"
-        logfile="${base_logfile}_attempt${attempt}.log"
- 
-        expect <<EOF >"$logfile" 2>&1
-log_user 1
-set timeout 10
-spawn bluetoothctl
-expect -re "#|\\[.*\\]#" { send "trust $target_mac\r" }
-expect -re "#|\\[.*\\]#" { send "connect $target_mac\r" }
- 
-expect {
-    -re "Connection successful" { exit 0 }
-    -re "Failed to connect|Device not available" { exit 1 }
-    timeout { exit 1 }
-}
-EOF
-        result=$?
-        if [ "$result" -eq 0 ]; then
-            log_pass "Post-pair connection successful"
-            return 0
-        fi
-        log_warn "Connect attempt $attempt failed (check $logfile)"
-        attempt=$((attempt + 1))
-        sleep 2
-    done
- 
-    # Fallback to l2ping
-    log_info "Falling back to l2ping for $target_mac"
-    l2ping_log="${base_logfile}_l2ping_${timestamp}.log"
-    if command -v l2ping >/dev/null 2>&1; then
-        # Capture all output—even if ping succeeds, we log it
-        if l2ping -c 3 -t 5 "$target_mac" 2>&1 | tee "$l2ping_log" | grep -q "bytes from"; then
-            log_pass "Fallback l2ping succeeded for $target_mac (see $l2ping_log)"
-            return 0
-        else
-            log_warn "l2ping failed or no response for $target_mac (see $l2ping_log)"
-        fi
-    else
-        log_warn "l2ping not available, skipping fallback"
-    fi 
-    log_fail "Post-pair connection failed for $target_mac"
-    return 1
-}
-
-# Find MAC address from device name in scan log
-bt_find_mac_by_name() {
-    target="$1"
-    log="$2"
-    grep -i "$target" "$log" | awk '{print $3}' | head -n1
-}
-
-bt_remove_all_paired_devices() {
-    log_info "Removing all previously paired Bluetooth devices..."
-    bluetoothctl paired-devices | awk '/Device/ {print $2}' | while read -r dev; do
-        log_info "Removing paired device $dev"
-        bluetoothctl remove "$dev" >/dev/null
-    done
-}
-
-# Validate connectivity using l2ping
-bt_l2ping_check() {
-    target_mac="$1"
-    logfile="$2"
-
-    if ! command -v l2ping >/dev/null 2>&1; then
-        log_warn "l2ping command not available - skipping"
-        return 1
-    fi
-
-    log_info "Running l2ping test for $target_mac"
-    if l2ping -c 3 -t 5 "$target_mac" >>"$logfile" 2>&1; then
-        log_pass "l2ping to $target_mac succeeded"
-        return 0
-    else
-        log_warn "l2ping to $target_mac failed"
-        return 1
-    fi
-}
-
 ###############################################################################
 # get_remoteproc_by_firmware <short-fw-name> [outfile] [all]
 # - If outfile is given: append *all* matches as "<path>|<state>|<firmware>|<name>"
@@ -2080,15 +1900,35 @@ dt_has_remoteproc_fw() {
 }
 
 # Find the remoteproc path for a given firmware substring (e.g., "adsp", "cdsp", "gdsp").
+# Logic:
+#   - grep -n over /sys/class/remoteproc/remoteproc*/firmware (one line per remoteproc)
+#   - Take the first matching line number (1-based)
+#   - Subtract 1 → remoteproc index → /sys/class/remoteproc/remoteproc${idx}
 get_remoteproc_path_by_firmware() {
-    name="$1"
-    idx path
-    # List all remoteproc firmware nodes, match name, and return the remoteproc path
-    idx=$(cat /sys/class/remoteproc/remoteproc*/firmware 2>/dev/null | grep -n "$name" | cut -d: -f1 | head -n1)
-    [ -z "$idx" ] && return 1
-    idx=$((idx - 1))
-    path="/sys/class/remoteproc/remoteproc${idx}"
-    [ -d "$path" ] && echo "$path" && return 0
+    name=$1
+ 
+    [ -n "$name" ] || return 1
+    [ -d /sys/class/remoteproc ] || return 1
+ 
+    for fw in /sys/class/remoteproc/remoteproc*/firmware; do
+        # Skip if glob didn't match any file
+        [ -f "$fw" ] || continue
+ 
+        # Read first line from firmware file without using cat
+        if IFS= read -r fwname <"$fw"; then
+            case "$fwname" in
+                *"$name"*)
+                    # Map firmware file back to its remoteproc directory
+                    dir=${fw%/firmware}
+                    if [ -d "$dir" ]; then
+                        printf '%s\n' "$dir"
+                        return 0
+                    fi
+                    ;;
+            esac
+        fi
+    done
+ 
     return 1
 }
 
@@ -3715,7 +3555,7 @@ ensure_network_online() {
         esac
     done
 
-    # -------- Wi-Fi pass --------
+    # -------- Wi-Fi pass (with bounded retry) --------
     net_wifi=""
     if command -v get_wifi_interface >/dev/null 2>&1; then
         net_wifi="$(get_wifi_interface 2>/dev/null || echo "")"
@@ -3733,49 +3573,82 @@ ensure_network_online() {
             net_creds="$(get_wifi_credentials "" "" 2>/dev/null || true)"
         fi
 
-        if [ -n "$net_creds" ]; then
-            net_ssid="$(printf '%s\n' "$net_creds" | awk '{print $1}')"
-            net_pass="$(printf '%s\n' "$net_creds" | awk '{print $2}')"
-            log_info "[NET] ${net_wifi}: trying nmcli for SSID='${net_ssid}'"
-            if command -v wifi_connect_nmcli >/dev/null 2>&1; then
-                wifi_connect_nmcli "$net_wifi" "$net_ssid" "$net_pass" || true
+        # ---- New: retry knobs (env-overridable) ----
+        wifi_max_attempts="${NET_WIFI_RETRIES:-2}"
+        wifi_retry_delay="${NET_WIFI_RETRY_DELAY:-5}"
+        if [ -z "$wifi_max_attempts" ] || [ "$wifi_max_attempts" -lt 1 ] 2>/dev/null; then
+            wifi_max_attempts=1
+        fi
+        if [ -z "$wifi_retry_delay" ] || [ "$wifi_retry_delay" -lt 0 ] 2>/dev/null; then
+            wifi_retry_delay=0
+        fi
+
+        wifi_attempt=1
+        while [ "$wifi_attempt" -le "$wifi_max_attempts" ]; do
+            if [ "$wifi_max_attempts" -gt 1 ]; then
+                log_info "[NET] ${net_wifi}: Wi-Fi attempt ${wifi_attempt}/${wifi_max_attempts}"
             fi
 
-            # If nmcli brought us up, do NOT fall back to wpa_supplicant
-            check_network_status_rc; net_rc=$?
-            if [ "$net_rc" -ne 0 ]; then
-                log_info "[NET] ${net_wifi}: falling back to wpa_supplicant + DHCP"
-                if command -v wifi_connect_wpa_supplicant >/dev/null 2>&1; then
-                    wifi_connect_wpa_supplicant "$net_wifi" "$net_ssid" "$net_pass" || true
+            if [ -n "$net_creds" ]; then
+                net_ssid="$(printf '%s\n' "$net_creds" | awk '{print $1}')"
+                net_pass="$(printf '%s\n' "$net_creds" | awk '{print $2}')"
+                log_info "[NET] ${net_wifi}: trying nmcli for SSID='${net_ssid}'"
+                if command -v wifi_connect_nmcli >/dev/null 2>&1; then
+                    wifi_connect_nmcli "$net_wifi" "$net_ssid" "$net_pass" || true
                 fi
+
+                # If nmcli brought us up, do NOT fall back to wpa_supplicant
+                check_network_status_rc; net_rc=$?
+                if [ "$net_rc" -ne 0 ]; then
+                    log_info "[NET] ${net_wifi}: falling back to wpa_supplicant + DHCP"
+                    if command -v wifi_connect_wpa_supplicant >/dev/null 2>&1; then
+                        wifi_connect_wpa_supplicant "$net_wifi" "$net_ssid" "$net_pass" || true
+                    fi
+                    if command -v run_dhcp_client >/dev/null 2>&1; then
+                        run_dhcp_client "$net_wifi" 10 >/dev/null 2>&1 || true
+                    fi
+                fi
+            else
+                log_info "[NET] ${net_wifi}: no credentials provided → DHCP only"
                 if command -v run_dhcp_client >/dev/null 2>&1; then
                     run_dhcp_client "$net_wifi" 10 >/dev/null 2>&1 || true
                 fi
             fi
-        else
-            log_info "[NET] ${net_wifi}: no credentials provided → DHCP only"
-            if command -v run_dhcp_client >/dev/null 2>&1; then
-                run_dhcp_client "$net_wifi" 10 >/dev/null 2>&1 || true
-            fi
-        fi
 
-        net_log_iface_snapshot "$net_wifi"
-        check_network_status_rc; net_rc=$?
-        case "$net_rc" in
-            0)
-                log_pass "[NET] ${net_wifi}: internet reachable"
-                ensure_reasonable_clock || log_warn "Proceeding in limited-network mode."
-                unset net_wifi net_ifaces net_ifc net_rc net_had_any_ip net_creds net_ssid net_pass
-                return 0
-                ;;
-            2)
-                log_warn "[NET] ${net_wifi}: IP assigned but internet not reachable"
-                net_had_any_ip=1
-                ;;
-            1)
-                log_info "[NET] ${net_wifi}: still no IP after connect/DHCP attempt"
-                ;;
-        esac
+            net_log_iface_snapshot "$net_wifi"
+            check_network_status_rc; net_rc=$?
+            case "$net_rc" in
+                0)
+                    log_pass "[NET] ${net_wifi}: internet reachable"
+                    ensure_reasonable_clock || log_warn "Proceeding in limited-network mode."
+                    unset net_wifi net_ifaces net_ifc net_rc net_had_any_ip net_creds net_ssid net_pass wifi_attempt wifi_max_attempts wifi_retry_delay
+                    return 0
+                    ;;
+                2)
+                    log_warn "[NET] ${net_wifi}: IP assigned but internet not reachable"
+                    net_had_any_ip=1
+                    ;;
+                1)
+                    log_info "[NET] ${net_wifi}: still no IP after connect/DHCP attempt"
+                    ;;
+            esac
+
+            # If not last attempt, cooldown + cleanup before retry
+            if [ "$wifi_attempt" -lt "$wifi_max_attempts" ]; then
+                if command -v wifi_cleanup >/dev/null 2>&1; then
+                    wifi_cleanup "$net_wifi" || true
+                fi
+                if command -v bringup_interface >/dev/null 2>&1; then
+                    bringup_interface "$net_wifi" 2 2 || true
+                fi
+                if [ "$wifi_retry_delay" -gt 0 ] 2>/dev/null; then
+                    log_info "[NET] ${net_wifi}: retrying in ${wifi_retry_delay}s…"
+                    sleep "$wifi_retry_delay"
+                fi
+            fi
+
+            wifi_attempt=$((wifi_attempt + 1))
+        done
     fi
 
     # -------- DHCP/route/DNS fixup (udhcpc script) --------
@@ -3812,4 +3685,114 @@ ensure_network_online() {
     fi
     unset net_script_path net_ifaces net_wifi net_ifc net_rc net_had_any_ip
     return 1
+}
+
+kill_process() {
+    PID="$1"
+    KILL_TERM_GRACE="${KILL_TERM_GRACE:-5}"
+    KILL_KILL_GRACE="${KILL_KILL_GRACE:-5}"
+    SELF_PID="$$"
+
+    # Safety checks
+    if [ "$PID" -eq 1 ] || [ "$PID" -eq "$SELF_PID" ]; then
+        log_warn "Refusing to kill PID $PID (init or self)"
+        return 1
+    fi
+
+    # Check if process exists
+    if ! kill -0 "$PID" 2>/dev/null; then
+        log_info "Process $PID not running"
+        return 0
+    fi
+
+    log_info "Sending SIGTERM to PID $PID"
+    kill -TERM "$PID" 2>/dev/null
+    sleep "$KILL_TERM_GRACE"
+
+    if kill -0 "$PID" 2>/dev/null; then
+        log_info "Sending SIGKILL to PID $PID"
+        kill -KILL "$PID" 2>/dev/null
+        sleep "$KILL_KILL_GRACE"
+    fi
+
+    # Final check
+    if kill -0 "$PID" 2>/dev/null; then
+        log_warn "Failed to kill process $PID"
+        return 1
+    else
+        log_info "Process $PID terminated successfully"
+        return 0
+    fi
+}
+
+is_process_running() {
+    if [ -z "$1" ]; then
+        log_info "Usage: is_running <process_name_or_pid>"
+        return 1
+    fi
+ 
+    input="$1"
+    case "$input" in
+    ''|*[!0-9]*)
+        # Non-numeric input: treat as process name
+        found=0
+ 
+        # Prefer pgrep if available (ShellCheck-friendly, efficient)
+        if command -v pgrep >/dev/null 2>&1; then
+            if pgrep -x "$input" >/dev/null 2>&1; then
+                found=1
+            fi
+        else
+            # POSIX fallback: avoid 'ps | grep' to silence SC2009
+            # Match as a separate word to mimic 'grep -w'
+            if ps -e 2>/dev/null | awk -v name="$input" '
+                $0 ~ ("(^|[[:space:]])" name "([[:space:]]|$)") { exit 0 }
+                END { exit 1 }
+            '; then
+                found=1
+            fi
+        fi
+ 
+        if [ "$found" -eq 1 ]; then
+            log_info "Process '$input' is running."
+            return 0
+        else
+            log_info "Process '$input' is not running."
+            return 1
+        fi
+        ;;
+    *)
+        # Numeric input: treat as PID
+        if kill -0 "$input" 2>/dev/null; then
+            log_info "Process with PID $input is running."
+            return 0
+        else
+            log_info "Process with PID $input is not running."
+            return 1
+        fi
+        ;;
+    esac
+}
+
+get_pid() {
+    if [ -z "$1" ]; then
+        log_info "Usage: get_pid <process_name>"
+        return 1
+    fi
+    
+    process_name="$1"
+    
+    # Try multiple ps variants for compatibility
+    pid=$(ps -e | awk -v name="$process_name" '$NF == name { print $1 }')
+    [ -z "$pid" ] && pid=$(ps -A | awk -v name="$process_name" '$NF == name { print $1 }')
+    [ -z "$pid" ] && pid=$(ps -aux | awk -v name="$process_name" '$11 == name { print $2 }')
+    [ -z "$pid" ] && pid=$(ps -ef | awk -v name="$process_name" '$NF == name { print $2 }')
+    
+    if [ -n "$pid" ]; then
+        echo "$pid"
+        return 0
+    else
+        log_info "Process '$process_name' not found."
+        return 1
+    fi
 }
